@@ -1,0 +1,28 @@
+{
+  "name": "@akaknele/aihubmix-auth",
+  "version": "2026.2.20",
+  "description": "OpenClaw AIHubmix API provider plugin",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "devDependencies": {
+    "openclaw": "^2026.2.18"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/akakenle/aihubmix-auth.git"
+  },
+  "bugs": {
+    "url": "https://github.com/akakenle/aihubmix-auth/issues"
+  },
+  "homepage": "https://github.com/akakenle/aihubmix-auth#readme"
+}

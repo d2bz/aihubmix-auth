@@ -1,6 +1,7 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-auth";
+import type { ProviderRuntimeModel } from "openclaw/plugin-sdk/provider-setup";
 import type {
   ModelApi,
   ModelDefinitionConfig,
@@ -367,16 +368,74 @@ function buildProviderConfig(
   };
 }
 
+const detectProviderFromModelId = (modelId: string): TextProvider => {
+  const lower = modelId.toLowerCase();
+  if (lower.startsWith("claude-")) return "anthropic";
+  if (lower.startsWith("gemini-")) return "google";
+  if (
+    lower.startsWith("gpt") ||
+    lower.startsWith("o1") ||
+    lower.startsWith("o3") ||
+    lower.startsWith("o4")
+  ) {
+    return "openai";
+  }
+  return "other";
+};
+
+function buildDynamicResolvedModel(params: {
+  modelId: string;
+  providerId: ProviderId;
+  baseUrl: string;
+}): ProviderRuntimeModel {
+  const { modelId, providerId, baseUrl } = params;
+  const provider = detectProviderFromModelId(modelId);
+  return {
+    id: modelId,
+    name: modelId,
+    provider: providerId,
+    api:
+      provider === "anthropic"
+        ? "anthropic-messages"
+        : provider === "google"
+          ? "google-generative-ai"
+          : "openai-completions",
+    baseUrl,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: FALLBACK_CONTEXT_TOKENS,
+    maxTokens: FALLBACK_MAX_TOKENS,
+    compat: { supportsDeveloperRole: false },
+  };
+}
+
+function optionKeyForProvider(provider: TextProvider): string {
+  return `aihubmixApiKey${provider.charAt(0).toUpperCase() + provider.slice(1)}`;
+}
+
+function defaultModelForProvider(
+  provider: TextProvider,
+  models: ModelMap,
+): string {
+  const bucket = models[provider];
+  if (bucket.length > 0) {
+    return `${PROVIDER_IDS[provider]}/${bucket[0].id}`;
+  }
+  return `${PROVIDER_IDS[provider]}/${provider === "openai" ? "gpt-4o-mini" : provider === "anthropic" ? "claude-3-5-sonnet-latest" : provider === "google" ? "gemini-1.5-pro-latest" : "gpt-4o-mini"}`;
+}
+
 function registerAihubmixProvider(params: {
   api: OpenClawPluginApi;
   provider: TextProvider;
   models: ModelMap;
-  apiKey: string;
+  envApiKey: string;
 }): void {
-  const { api, provider, models, apiKey } = params;
+  const { api, provider, models, envApiKey } = params;
   const id: ProviderId = PROVIDER_IDS[provider];
   const label = PROVIDER_LABELS[provider];
   const config = buildProviderConfig(provider, models);
+  const defaultModel = defaultModelForProvider(provider, models);
 
   api.registerProvider({
     id,
@@ -389,33 +448,28 @@ function registerAihubmixProvider(params: {
         methodId: "api-key",
         label: `${label} API key`,
         hint: "Paste one AIHubmix key shared across all four transports",
-        optionKey: `aihubmixApiKey${provider.charAt(0).toUpperCase() + provider.slice(1)}`,
+        optionKey: optionKeyForProvider(provider),
         flagName: FLAG_NAME,
         envVar: API_KEY_ENV,
         promptMessage: `AIHubmix API key (${label})`,
-        defaultModel: `${id}/${models.openai[0]?.id ?? models.anthropic[0]?.id ?? models.google[0]?.id ?? models.other[0]?.id ?? "gpt-4o-mini"}`,
+        defaultModel,
         applyConfig: (cfg) => {
-          if (!apiKey) return cfg;
           const existing = cfg.models?.providers?.[id];
-          if (existing) {
-            return {
-              ...cfg,
-              models: {
-                ...(cfg.models ?? {}),
-                providers: {
-                  ...(cfg.models?.providers ?? {}),
-                  [id]: { ...existing, apiKey },
-                },
-              },
-            };
-          }
+          const base: ModelProviderConfig = existing
+            ? { ...existing, ...config, models: existing.models ?? config.models }
+            : { ...config };
+          // baseUrl / api are static routes; only embed the apiKey inline when
+          // a non-empty value is supplied. The credential is also stored in the
+          // auth-profile by applyApiKeyConfig, so an empty inline apiKey is OK.
           return {
             ...cfg,
             models: {
               ...(cfg.models ?? {}),
               providers: {
                 ...(cfg.models?.providers ?? {}),
-                [id]: { ...config, apiKey },
+                [id]: envApiKey
+                  ? { ...base, apiKey: envApiKey }
+                  : base,
               },
             },
           };
@@ -425,7 +479,7 @@ function registerAihubmixProvider(params: {
     catalog: {
       order: "simple",
       run: async (ctx) => {
-        const resolved = ctx.resolveProviderApiKey(id)?.apiKey ?? apiKey;
+        const resolved = ctx.resolveProviderApiKey(id)?.apiKey ?? envApiKey;
         if (!resolved) return null;
         try {
           const fetched = await fetchAihubmixModels(resolved);
@@ -439,13 +493,19 @@ function registerAihubmixProvider(params: {
       order: "simple",
       run: async () => ({ provider: config }),
     },
+    resolveDynamicModel: (ctx) =>
+      buildDynamicResolvedModel({
+        modelId: ctx.modelId,
+        providerId: id,
+        baseUrl: config.baseUrl,
+      }),
   });
 
   api.registerModelCatalogProvider({
     provider: id,
     kinds: ["text"],
     liveCatalog: async (ctx) => {
-      const resolved = ctx.resolveProviderApiKey(id)?.apiKey ?? apiKey;
+      const resolved = ctx.resolveProviderApiKey(id)?.apiKey ?? envApiKey;
       if (!resolved) return null;
       try {
         const fetched = await fetchAihubmixModels(resolved);
@@ -478,51 +538,16 @@ const entry: PluginEntry = definePluginEntry({
   name: "AIHubmix",
   description: "Route OpenAI/Anthropic/Gemini model calls through AIHubmix",
   register(api: OpenClawPluginApi) {
-    const apiKey = (process.env[API_KEY_ENV] ?? "").trim();
+    const envApiKey = (process.env[API_KEY_ENV] ?? "").trim();
     const models: ModelMap = { openai: [], anthropic: [], google: [], other: [] };
 
     for (const provider of Object.keys(MODEL_LIMITS) as TextProvider[]) {
-      registerAihubmixProvider({ api, provider, models, apiKey });
-    }
-
-    if (apiKey) {
-      void fetchAihubmixModels(apiKey)
-        .then((fetched) => {
-          for (const provider of Object.keys(MODEL_LIMITS) as TextProvider[]) {
-            const id = PROVIDER_IDS[provider];
-            api.registerModelCatalogProvider({
-              provider: id,
-              kinds: ["text"],
-              liveCatalog: async (ctx) => {
-                const resolved = ctx.resolveProviderApiKey(id)?.apiKey ?? apiKey;
-                if (!resolved) return null;
-                try {
-                  const fresh = await fetchAihubmixModels(resolved);
-                  return fresh[provider].map((model) => ({
-                    kind: "text" as const,
-                    provider: id,
-                    model: model.id,
-                    label: model.name,
-                    source: "live" as const,
-                  }));
-                } catch {
-                  return null;
-                }
-              },
-              staticCatalog: async () =>
-                fetched[provider].map((model) => ({
-                  kind: "text" as const,
-                  provider: id,
-                  model: model.id,
-                  label: model.name,
-                  source: "static" as const,
-                })),
-            });
-          }
-        })
-        .catch(() => {
-          // Catalog warm-up is best-effort; live catalog still falls back to the catalog hook.
-        });
+      registerAihubmixProvider({
+        api,
+        provider,
+        models,
+        envApiKey,
+      });
     }
   },
 });

@@ -1,6 +1,6 @@
 {
-  "name": "@akaknele/aihubmix-auth",
-  "version": "2026.2.20",
+  "name": "@akakenle/aihubmix-auth",
+  "version": "2026.2.21",
   "description": "OpenClaw AIHubmix API provider plugin",
   "type": "module",
   "main": "./dist/index.js",
@@ -21,6 +21,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
@@ -43,7 +44,7 @@
       "pluginApi": ">=2026.5.27"
     },
     "install": {
-      "npmSpec": "@akaknele/aihubmix-auth@2026.2.20",
+      "npmSpec": "@akakenle/aihubmix-auth@2026.2.21",
       "minHostVersion": ">=2026.5.27"
     }
   },

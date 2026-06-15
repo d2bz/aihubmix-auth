@@ -261,4 +261,73 @@ describe("aihubmix-auth plugin", () => {
     expect(rows.find((r) => r.model === "gpt-x")).toBeDefined();
     expect(rows.find((r) => r.model === "claude-x")).toBeUndefined();
   });
+
+  it("registers exactly one unified model catalog provider per provider id", () => {
+    const counts = new Map<string, number>();
+    for (const catalog of capture.catalogs) {
+      counts.set(catalog.provider, (counts.get(catalog.provider) ?? 0) + 1);
+    }
+    for (const id of PROVIDER_IDS) {
+      expect(counts.get(id) ?? 0).toBe(1);
+    }
+  });
+
+  it("registers a resolveDynamicModel hook on every provider that routes by id prefix", () => {
+    const claude = findProvider(capture.providers, "aihubmix-anthropic");
+    const gemini = findProvider(capture.providers, "aihubmix-google");
+    const openai = findProvider(capture.providers, "aihubmix-openai");
+    if (!claude.resolveDynamicModel || !gemini.resolveDynamicModel || !openai.resolveDynamicModel) {
+      throw new Error("resolveDynamicModel was not registered on every provider.");
+    }
+    const claudeResolved = claude.resolveDynamicModel({ modelId: "claude-sonnet-4-6" }) as {
+      provider: string;
+      api: string;
+      baseUrl: string;
+    };
+    const geminiResolved = gemini.resolveDynamicModel({ modelId: "gemini-2-5-pro" }) as {
+      provider: string;
+      api: string;
+      baseUrl: string;
+    };
+    const openaiResolved = openai.resolveDynamicModel({ modelId: "gpt-5-4" }) as {
+      provider: string;
+      api: string;
+      baseUrl: string;
+    };
+    expect(claudeResolved.api).toBe("anthropic-messages");
+    expect(claudeResolved.baseUrl).toBe("https://aihubmix.com");
+    expect(geminiResolved.api).toBe("google-generative-ai");
+    expect(geminiResolved.baseUrl).toBe("https://aihubmix.com/gemini/v1beta");
+    expect(openaiResolved.api).toBe("openai-completions");
+    expect(openaiResolved.baseUrl).toBe("https://aihubmix.com/v1");
+  });
+
+  it("staticCatalog always carries baseUrl/api route config (no key gate)", async () => {
+    // applyConfig in the source code unconditionally writes the baseUrl/api
+    // route block; staticCatalog is the offline projection that must always
+    // surface the same route, even before a key is configured.
+    for (const id of PROVIDER_IDS) {
+      const provider = findProvider(capture.providers, id);
+      if (!provider.staticCatalog) {
+        throw new Error(`staticCatalog missing for ${id}.`);
+      }
+      const projection = (await provider.staticCatalog.run({})) as {
+        provider: { baseUrl: string; api: string };
+      };
+      const expectedBase =
+        id === "aihubmix-anthropic"
+          ? "https://aihubmix.com"
+          : id === "aihubmix-google"
+            ? "https://aihubmix.com/gemini/v1beta"
+            : "https://aihubmix.com/v1";
+      const expectedApi =
+        id === "aihubmix-anthropic"
+          ? "anthropic-messages"
+          : id === "aihubmix-google"
+            ? "google-generative-ai"
+            : "openai-completions";
+      expect(projection.provider.baseUrl).toBe(expectedBase);
+      expect(projection.provider.api).toBe(expectedApi);
+    }
+  });
 });

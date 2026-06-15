@@ -4,3 +4,7 @@ dist/
 npm-debug.log*
 .DS_Store
 *.tsbuildinfo
+
+# Local code-review artifacts (not part of the published plugin)
+CODE_REVIEW.md
+REVIEW_NOTES.md

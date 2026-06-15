@@ -1,31 +1,57 @@
-import {
-  emptyPluginConfigSchema,
-  type OpenClawPluginApi,
-  type ProviderAuthContext,
-  type ProviderAuthResult,
-} from "openclaw/plugin-sdk";
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-auth";
+import type {
+  ModelApi,
+  ModelDefinitionConfig,
+  ModelProviderConfig,
+} from "openclaw/plugin-sdk/provider-model-types";
+
+type OpenClawConfig = {
+  models?: {
+    providers?: Record<string, ModelProviderConfig>;
+  };
+};
 
 const PLUGIN_ID = "aihubmix-auth";
-const PROVIDER_ID = "aihubmix";
-const PROVIDER_LABEL = "AIHubmix";
+
+const PROVIDER_IDS = {
+  openai: "aihubmix-openai",
+  anthropic: "aihubmix-anthropic",
+  google: "aihubmix-google",
+  other: "aihubmix-other",
+} as const;
+
+const PROVIDER_LABELS = {
+  openai: "AIHubmix (OpenAI)",
+  anthropic: "AIHubmix (Anthropic)",
+  google: "AIHubmix (Google)",
+  other: "AIHubmix (Other)",
+} as const;
+
+const API_KEY_ENV = "AIHUBMIX_API_KEY";
+const FLAG_NAME = "--aihubmix-api-key" as const;
+
 const OPENAI_BASE_URL = "https://aihubmix.com/v1";
 const ANTHROPIC_BASE_URL = "https://aihubmix.com";
 const GOOGLE_BASE_URL = "https://aihubmix.com/gemini/v1beta";
 const AIHUBMIX_MODELS_URL = "https://aihubmix.com/api/v1/models";
-const AIHUBMIX_RECENT_SORT_BY = "order";
-const AIHUBMIX_RECENT_SORT_ORDER = "desc";
+
+const SORT_BY = "order";
+const SORT_ORDER = "desc";
 const FALLBACK_CONTEXT_TOKENS = 200_000;
 const FALLBACK_MAX_TOKENS = 8192;
-const AIHUBMIX_MODEL_LIMITS = {
+const MODEL_LIMITS = {
   openai: 10,
   anthropic: 10,
   google: 10,
   other: 20,
 } as const;
 
-type TextModelProvider = "openai" | "anthropic" | "google" | "other";
+type TextProvider = keyof typeof MODEL_LIMITS;
+type ProviderId = (typeof PROVIDER_IDS)[TextProvider];
 
-type AihubmixModelRecord = {
+interface AihubmixModelRecord {
   model_id?: unknown;
   model_name?: unknown;
   endpoints?: unknown;
@@ -33,33 +59,36 @@ type AihubmixModelRecord = {
   input_modalities?: unknown;
   max_output?: unknown;
   context_length?: unknown;
-};
-
-type AihubmixModelListResponse = {
-  data?: unknown;
-};
-
-type AihubmixModelDefinition = ReturnType<typeof buildModelDefinition>;
-type ModelMap = Record<TextModelProvider, AihubmixModelDefinition[]>;
-
-type ProviderModelAllowlist = Record<string, Record<string, never>>;
-
-type ModelBucket = {
-  provider: TextModelProvider;
-  limit: number;
-  items: Array<{ value: AihubmixModelDefinition; order: number }>;
-};
-
-type CatalogAuthAttempt = {
-  label: string;
-  headers: Record<string, string>;
-};
-
-function trimText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
+  order?: unknown;
 }
 
-function splitList(value: unknown): string[] {
+interface AihubmixModelListResponse {
+  data?: unknown;
+}
+
+interface AihubmixModelDefinition {
+  id: string;
+  name: string;
+  api: ModelApi;
+  reasoning: boolean;
+  input: Array<"text" | "image" | "audio" | "video">;
+  cost: { input: 0; output: 0; cacheRead: 0; cacheWrite: 0 };
+  contextWindow: number;
+  maxTokens: number;
+  compat?: { supportsDeveloperRole?: boolean };
+}
+
+type ModelMap = Record<TextProvider, AihubmixModelDefinition[]>;
+
+interface CatalogAuthAttempt {
+  label: string;
+  headers: Record<string, string>;
+}
+
+const trimText = (value: unknown): string =>
+  typeof value === "string" ? value.trim() : "";
+
+const splitList = (value: unknown): string[] => {
   if (Array.isArray(value)) {
     return value
       .filter((item): item is string => typeof item === "string")
@@ -73,61 +102,42 @@ function splitList(value: unknown): string[] {
       .filter(Boolean);
   }
   return [];
-}
+};
 
-function extractModelOrder(record: AihubmixModelRecord): number {
-  const numeric = Number((record as Record<string, unknown>).order);
-  if (!Number.isFinite(numeric)) {
-    return -Infinity;
-  }
-  return numeric;
-}
-
-function limitForProvider(provider: TextModelProvider): number {
-  if (provider === "other") {
-    return AIHUBMIX_MODEL_LIMITS.other;
-  }
-  return AIHUBMIX_MODEL_LIMITS[provider];
-}
-
-function toPositiveInt(value: unknown, fallback: number): number {
+const toPositiveInt = (value: unknown, fallback: number): number => {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) {
     return fallback;
   }
   return Math.floor(numeric);
-}
+};
 
-function normalizeApiKey(value: string | undefined): string {
-  return value?.trim() ?? "";
-}
+const extractOrder = (record: AihubmixModelRecord): number => {
+  const numeric = Number(record.order);
+  return Number.isFinite(numeric) ? numeric : -Infinity;
+};
 
-function resolveApiKeyFromInput(input: string): string {
-  const trimmed = input.trim();
-  if (!trimmed) {
-    throw new Error("AIHubmix API key is required.");
-  }
-  return trimmed;
-}
-
-function dedupeModelInputs(values: string[]): Array<"text" | "image"> {
+const dedupeInputs = (values: string[]): Array<"text" | "image" | "audio" | "video"> => {
   const normalized = values
     .map((value) => value.toLowerCase())
-    .filter((value) => value === "text" || value === "image");
-  const withImage = normalized.includes("image");
-  return ["text", ...(withImage ? ["image"] : [])];
-}
+    .filter((value): value is "text" | "image" | "audio" | "video" =>
+      value === "text" || value === "image" || value === "audio" || value === "video",
+    );
+  if (!normalized.includes("text")) normalized.unshift("text");
+  return normalized;
+};
 
-function detectProvider(modelId: string, record: AihubmixModelRecord): TextModelProvider {
-  const lowerModelId = modelId.toLowerCase();
-  if (lowerModelId.startsWith("claude-")) {
-    return "anthropic";
-  }
-  if (lowerModelId.startsWith("gemini-")) {
-    return "google";
-  }
+const detectProvider = (
+  modelId: string,
+  record: AihubmixModelRecord,
+): TextProvider => {
+  const lower = modelId.toLowerCase();
+  if (lower.startsWith("claude-")) return "anthropic";
+  if (lower.startsWith("gemini-")) return "google";
 
-  const endpointHints = new Set(splitList(record.endpoints).map((item) => item.toLowerCase()));
+  const endpointHints = new Set(
+    splitList(record.endpoints).map((item) => item.toLowerCase()),
+  );
   if (endpointHints.has("claude_api") && !endpointHints.has("gemini_api")) {
     return "anthropic";
   }
@@ -136,78 +146,67 @@ function detectProvider(modelId: string, record: AihubmixModelRecord): TextModel
   }
 
   if (
-    lowerModelId.startsWith("gpt") ||
-    lowerModelId.startsWith("o1") ||
-    lowerModelId.startsWith("o3") ||
-    lowerModelId.startsWith("o4")
+    lower.startsWith("gpt") ||
+    lower.startsWith("o1") ||
+    lower.startsWith("o3") ||
+    lower.startsWith("o4")
   ) {
     return "openai";
   }
 
   return "other";
-}
+};
 
-function buildModelDefinition(params: {
+const buildModelDefinition = (params: {
   modelId: string;
   modelName: string;
   record: AihubmixModelRecord;
-  provider: TextModelProvider;
-}) {
-  const featureSet = new Set(
+  provider: TextProvider;
+}): AihubmixModelDefinition => {
+  const features = new Set(
     splitList(params.record.features).map((feature) => feature.toLowerCase()),
   );
-  const contextWindow = toPositiveInt(params.record.context_length, FALLBACK_CONTEXT_TOKENS);
+  const contextWindow = toPositiveInt(
+    params.record.context_length,
+    FALLBACK_CONTEXT_TOKENS,
+  );
   const maxOutput = toPositiveInt(
     params.record.max_output,
     Math.min(contextWindow, FALLBACK_MAX_TOKENS),
   );
 
+  const api: ModelApi =
+    params.provider === "google"
+      ? "google-generative-ai"
+      : params.provider === "anthropic"
+        ? "anthropic-messages"
+        : "openai-completions";
+
   return {
     id: params.modelId,
     name: params.modelName,
-    api:
-      params.provider === "google"
-        ? ("google-generative-ai" as const)
-        : params.provider === "anthropic"
-          ? ("anthropic-messages" as const)
-          : ("openai-completions" as const),
-    reasoning: featureSet.has("thinking"),
-    input: dedupeModelInputs(splitList(params.record.input_modalities)),
+    api,
+    reasoning: features.has("thinking"),
+    input: dedupeInputs(splitList(params.record.input_modalities)),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens: Math.min(contextWindow, maxOutput),
     compat: { supportsDeveloperRole: false },
   };
-}
+};
 
-function buildAgentModelAllowlist(modelsByProvider: ModelMap): ProviderModelAllowlist {
-  const entries: ProviderModelAllowlist = {};
-
-  for (const [provider, models] of Object.entries(modelsByProvider) as Array<
-    [TextModelProvider, AihubmixModelDefinition[]]
-  >) {
-    for (const model of models) {
-      const modelId = model.id.trim();
-      if (!modelId) {
-        continue;
-      }
-      entries[`${provider}/${modelId}`] = {};
-    }
-  }
-
-  return entries;
-}
-
-function buildAihubmixModelsUrl(): string {
+const buildModelsUrl = (): string => {
   const url = new URL(AIHUBMIX_MODELS_URL);
-  url.searchParams.set("sort_by", AIHUBMIX_RECENT_SORT_BY);
-  url.searchParams.set("sort_order", AIHUBMIX_RECENT_SORT_ORDER);
+  url.searchParams.set("sort_by", SORT_BY);
+  url.searchParams.set("sort_order", SORT_ORDER);
   return url.toString();
-}
+};
 
-function buildCatalogAuthAttempts(apiKey: string): CatalogAuthAttempt[] {
+const buildCatalogAuthAttempts = (apiKey: string): CatalogAuthAttempt[] => {
   if (!apiKey) {
-    return [{ label: "unauthenticated", headers: { Accept: "application/json" } }];
+    return [
+      { label: "unauthenticated", headers: { Accept: "application/json" } },
+    ];
   }
   return [
     {
@@ -232,25 +231,21 @@ function buildCatalogAuthAttempts(apiKey: string): CatalogAuthAttempt[] {
       },
     },
   ];
-}
+};
 
-function trimErrorDetail(value: string): string {
+const trimErrorDetail = (value: string): string => {
   const trimmed = value.replace(/\s+/g, " ").trim();
-  if (!trimmed) {
-    return "";
-  }
+  if (!trimmed) return "";
   return trimmed.length > 180 ? `${trimmed.slice(0, 180)}...` : trimmed;
-}
+};
 
 async function fetchAihubmixModels(apiKey: string): Promise<ModelMap> {
+  const empty: ModelMap = { openai: [], anthropic: [], google: [], other: [] };
   let payload: AihubmixModelListResponse | null = null;
   const failures: string[] = [];
 
   for (const attempt of buildCatalogAuthAttempts(apiKey)) {
-    const response = await fetch(buildAihubmixModelsUrl(), {
-      headers: attempt.headers,
-    });
-
+    const response = await fetch(buildModelsUrl(), { headers: attempt.headers });
     if (!response.ok) {
       const detail = trimErrorDetail(await response.text());
       failures.push(
@@ -265,7 +260,9 @@ async function fetchAihubmixModels(apiKey: string): Promise<ModelMap> {
       payload = (await response.json()) as AihubmixModelListResponse;
     } catch (error) {
       throw new Error(
-        `AIHubmix model API returned invalid JSON: ${error instanceof Error ? error.message : "unknown error"}`,
+        `AIHubmix model API returned invalid JSON: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`,
       );
     }
     break;
@@ -276,34 +273,19 @@ async function fetchAihubmixModels(apiKey: string): Promise<ModelMap> {
     throw new Error(`Failed to fetch model catalog.${detail}`);
   }
 
-  const limitBuckets: Record<TextModelProvider, ModelBucket> = {
-    openai: { provider: "openai", limit: limitForProvider("openai"), items: [] },
-    anthropic: {
-      provider: "anthropic",
-      limit: limitForProvider("anthropic"),
-      items: [],
-    },
-    google: { provider: "google", limit: limitForProvider("google"), items: [] },
-    other: { provider: "other", limit: limitForProvider("other"), items: [] },
-  };
-
   const rawModels = Array.isArray(payload.data) ? payload.data : [];
-  if (rawModels.length === 0) {
-    return {
-      openai: [],
-      anthropic: [],
-      google: [],
-      other: [],
-    };
-  }
+  if (rawModels.length === 0) return empty;
 
-  const modelsByProvider: Record<TextModelProvider, AihubmixModelDefinition[]> = {
+  const buckets: Record<
+    TextProvider,
+    Array<{ value: AihubmixModelDefinition; order: number }>
+  > = {
     openai: [],
     anthropic: [],
     google: [],
     other: [],
   };
-  const seenIds: Record<TextModelProvider, Set<string>> = {
+  const seen: Record<TextProvider, Set<string>> = {
     openai: new Set(),
     anthropic: new Set(),
     google: new Set(),
@@ -313,206 +295,236 @@ async function fetchAihubmixModels(apiKey: string): Promise<ModelMap> {
   for (const raw of rawModels) {
     const record = raw as AihubmixModelRecord;
     const modelId = trimText(record.model_id);
-    if (!modelId) {
-      continue;
-    }
+    if (!modelId) continue;
 
     const provider = detectProvider(modelId, record);
     if (
-      seenIds[provider].has(modelId) ||
-      seenIds.openai.has(modelId) ||
-      seenIds.anthropic.has(modelId) ||
-      seenIds.google.has(modelId) ||
-      seenIds.other.has(modelId)
+      seen.openai.has(modelId) ||
+      seen.anthropic.has(modelId) ||
+      seen.google.has(modelId) ||
+      seen.other.has(modelId) ||
+      seen[provider].has(modelId)
     ) {
       continue;
     }
-    seenIds[provider].add(modelId);
+    seen[provider].add(modelId);
 
     const modelName = trimText(record.model_name) || modelId;
-    const modelDefinition = buildModelDefinition({
-      modelId,
-      modelName,
-      record,
-      provider,
-    });
-
-    modelsByProvider[provider].push(modelDefinition);
-    limitBuckets[provider].items.push({
-      value: modelDefinition,
-      order: extractModelOrder(record),
-    });
+    const model = buildModelDefinition({ modelId, modelName, record, provider });
+    buckets[provider].push({ value: model, order: extractOrder(record) });
   }
 
-  const selectedModels = (provider: TextModelProvider): AihubmixModelDefinition[] => {
-    return limitBuckets[provider].items
+  const sortAndTrim = (provider: TextProvider): AihubmixModelDefinition[] =>
+    buckets[provider]
       .sort((left, right) => right.order - left.order)
-      .slice(0, limitForProvider(provider))
+      .slice(0, MODEL_LIMITS[provider])
       .map((item) => item.value);
+
+  return {
+    openai: sortAndTrim("openai"),
+    anthropic: sortAndTrim("anthropic"),
+    google: sortAndTrim("google"),
+    other: sortAndTrim("other"),
   };
-
-  const openaiTop = selectedModels("openai");
-  const anthropicTop = selectedModels("anthropic");
-  const googleTop = selectedModels("google");
-  const otherTop = selectedModels("other");
-
-  modelsByProvider.openai = openaiTop;
-  modelsByProvider.anthropic = anthropicTop;
-  modelsByProvider.google = googleTop;
-  modelsByProvider.other = otherTop;
-
-  return modelsByProvider;
 }
 
-function makeDefaultModel(modelsByProvider: ModelMap): string | undefined {
-  if (modelsByProvider.openai[0]) {
-    return `openai/${modelsByProvider.openai[0].id}`;
-  }
-  if (modelsByProvider.anthropic[0]) {
-    return `anthropic/${modelsByProvider.anthropic[0].id}`;
-  }
-  if (modelsByProvider.google[0]) {
-    return `google/${modelsByProvider.google[0].id}`;
-  }
-  if (modelsByProvider.other[0]) {
-    return `other/${modelsByProvider.other[0].id}`;
-  }
-  return undefined;
+function toModelDefinition(
+  model: AihubmixModelDefinition,
+): ModelDefinitionConfig {
+  return {
+    id: model.id,
+    name: model.name,
+    api: model.api,
+    reasoning: model.reasoning,
+    input: model.input,
+    cost: model.cost,
+    contextWindow: model.contextWindow,
+    maxTokens: model.maxTokens,
+    compat: model.compat,
+  };
 }
 
-const aihubmixPlugin = {
-  id: PLUGIN_ID,
-  name: "AIHubmix API",
-  description: "Route OpenAI/Anthropic/Gemini model calls through AIHubmix",
-  configSchema: emptyPluginConfigSchema(),
-  register(api: OpenClawPluginApi) {
-    api.registerProvider({
-      id: PROVIDER_ID,
-      label: PROVIDER_LABEL,
-      docsPath: "/providers/models",
-      aliases: ["aihubmix-api"],
-      auth: [
-        {
-          id: "api-key",
-          label: "AIHubmix API key",
-          hint: "Paste one AIHubmix key shared by OpenAI, Anthropic, and Gemini",
-          kind: "api_key",
-          run: async (ctx: ProviderAuthContext): Promise<ProviderAuthResult> => {
-            const rawKey = String(
-              await ctx.prompter.text({
-                message: "AIHubmix API key",
-              }),
-            );
-            const apiKey = resolveApiKeyFromInput(rawKey);
-            const normalizedApiKey = normalizeApiKey(apiKey);
+function buildProviderConfig(
+  provider: TextProvider,
+  models: ModelMap,
+): ModelProviderConfig {
+  const baseUrl =
+    provider === "anthropic"
+      ? ANTHROPIC_BASE_URL
+      : provider === "google"
+        ? GOOGLE_BASE_URL
+        : OPENAI_BASE_URL;
+  const api: ModelApi =
+    provider === "anthropic"
+      ? "anthropic-messages"
+      : provider === "google"
+        ? "google-generative-ai"
+        : "openai-completions";
+  return {
+    baseUrl,
+    api,
+    models: models[provider].map(toModelDefinition),
+  };
+}
 
-            const notes: string[] = [
-              "AIHubmix API key is saved to auth-profiles for openai/anthropic/google/other providers.",
-              "OpenAI-style models use baseUrl: https://aihubmix.com/v1 and openai-completions.",
-              "Anthropic models are configured with anthropic-messages and baseUrl https://aihubmix.com (calls /v1/messages).",
-              "Gemini models are configured with google-generative-ai and baseUrl https://aihubmix.com/gemini/v1beta (calls /models/{model}:...).",
-              "Auth headers stay provider-native: OpenAI=Authorization Bearer, Anthropic=x-api-key, Gemini=x-goog-api-key.",
-            ];
+function registerAihubmixProvider(params: {
+  api: OpenClawPluginApi;
+  provider: TextProvider;
+  models: ModelMap;
+  apiKey: string;
+}): void {
+  const { api, provider, models, apiKey } = params;
+  const id: ProviderId = PROVIDER_IDS[provider];
+  const label = PROVIDER_LABELS[provider];
+  const config = buildProviderConfig(provider, models);
 
-            let modelsByProvider: ModelMap = {
-              openai: [],
-              anthropic: [],
-              google: [],
-              other: [],
-            };
-
-            try {
-              modelsByProvider = await fetchAihubmixModels(normalizedApiKey);
-              notes.push("Fetched the latest model catalog from AIHubmix API.");
-            } catch (error) {
-              notes.push(
-                error instanceof Error
-                  ? `Model catalog fetch failed: ${error.message}. Using empty model lists.`
-                  : "Model catalog fetch failed. Using empty model lists.",
-              );
-            }
-
-            const defaultModel = makeDefaultModel(modelsByProvider);
-            const modelAllowlist = buildAgentModelAllowlist(modelsByProvider);
-
+  api.registerProvider({
+    id,
+    label,
+    docsPath: "/providers/models",
+    envVars: [API_KEY_ENV],
+    auth: [
+      createProviderApiKeyAuthMethod({
+        providerId: id,
+        methodId: "api-key",
+        label: `${label} API key`,
+        hint: "Paste one AIHubmix key shared across all four transports",
+        optionKey: `aihubmixApiKey${provider.charAt(0).toUpperCase() + provider.slice(1)}`,
+        flagName: FLAG_NAME,
+        envVar: API_KEY_ENV,
+        promptMessage: `AIHubmix API key (${label})`,
+        defaultModel: `${id}/${models.openai[0]?.id ?? models.anthropic[0]?.id ?? models.google[0]?.id ?? models.other[0]?.id ?? "gpt-4o-mini"}`,
+        applyConfig: (cfg) => {
+          if (!apiKey) return cfg;
+          const existing = cfg.models?.providers?.[id];
+          if (existing) {
             return {
-              profiles: [
-                {
-                  profileId: "openai:aihubmix",
-                  credential: {
-                    type: "api_key",
-                    provider: "openai",
-                    key: normalizedApiKey,
-                  },
+              ...cfg,
+              models: {
+                ...(cfg.models ?? {}),
+                providers: {
+                  ...(cfg.models?.providers ?? {}),
+                  [id]: { ...existing, apiKey },
                 },
-                {
-                  profileId: "anthropic:aihubmix",
-                  credential: {
-                    type: "api_key",
-                    provider: "anthropic",
-                    key: normalizedApiKey,
-                  },
-                },
-                {
-                  profileId: "google:aihubmix",
-                  credential: {
-                    type: "api_key",
-                    provider: "google",
-                    key: normalizedApiKey,
-                  },
-                },
-                {
-                  profileId: "other:aihubmix",
-                  credential: {
-                    type: "api_key",
-                    provider: "other",
-                    key: normalizedApiKey,
-                  },
-                },
-              ],
-              configPatch: {
-                models: {
-                  providers: {
-                    openai: {
-                      baseUrl: OPENAI_BASE_URL,
-                      api: "openai-completions",
-                      models: modelsByProvider.openai,
-                    },
-                    anthropic: {
-                      baseUrl: ANTHROPIC_BASE_URL,
-                      api: "anthropic-messages",
-                      models: modelsByProvider.anthropic,
-                    },
-                    google: {
-                      baseUrl: GOOGLE_BASE_URL,
-                      api: "google-generative-ai",
-                      models: modelsByProvider.google,
-                    },
-                    other: {
-                      baseUrl: OPENAI_BASE_URL,
-                      api: "openai-completions",
-                      models: modelsByProvider.other,
-                    },
-                  },
-                },
-                ...(Object.keys(modelAllowlist).length > 0
-                  ? {
-                      agents: {
-                        defaults: {
-                          models: modelAllowlist,
-                        },
-                      },
-                    }
-                  : {}),
               },
-              ...(defaultModel ? { defaultModel } : {}),
-              notes,
             };
-          },
+          }
+          return {
+            ...cfg,
+            models: {
+              ...(cfg.models ?? {}),
+              providers: {
+                ...(cfg.models?.providers ?? {}),
+                [id]: { ...config, apiKey },
+              },
+            },
+          };
         },
-      ],
-    });
-  },
-};
+      }),
+    ],
+    catalog: {
+      order: "simple",
+      run: async (ctx) => {
+        const resolved = ctx.resolveProviderApiKey(id)?.apiKey ?? apiKey;
+        if (!resolved) return null;
+        try {
+          const fetched = await fetchAihubmixModels(resolved);
+          return { provider: buildProviderConfig(provider, fetched) };
+        } catch {
+          return null;
+        }
+      },
+    },
+    staticCatalog: {
+      order: "simple",
+      run: async () => ({ provider: config }),
+    },
+  });
 
-export default aihubmixPlugin;
+  api.registerModelCatalogProvider({
+    provider: id,
+    kinds: ["text"],
+    liveCatalog: async (ctx) => {
+      const resolved = ctx.resolveProviderApiKey(id)?.apiKey ?? apiKey;
+      if (!resolved) return null;
+      try {
+        const fetched = await fetchAihubmixModels(resolved);
+        return fetched[provider].map((model) => ({
+          kind: "text" as const,
+          provider: id,
+          model: model.id,
+          label: model.name,
+          source: "live" as const,
+        }));
+      } catch {
+        return null;
+      }
+    },
+    staticCatalog: async () =>
+      models[provider].map((model) => ({
+        kind: "text" as const,
+        provider: id,
+        model: model.id,
+        label: model.name,
+        source: "static" as const,
+      })),
+  });
+}
+
+type PluginEntry = ReturnType<typeof definePluginEntry>;
+
+const entry: PluginEntry = definePluginEntry({
+  id: PLUGIN_ID,
+  name: "AIHubmix",
+  description: "Route OpenAI/Anthropic/Gemini model calls through AIHubmix",
+  register(api: OpenClawPluginApi) {
+    const apiKey = (process.env[API_KEY_ENV] ?? "").trim();
+    const models: ModelMap = { openai: [], anthropic: [], google: [], other: [] };
+
+    for (const provider of Object.keys(MODEL_LIMITS) as TextProvider[]) {
+      registerAihubmixProvider({ api, provider, models, apiKey });
+    }
+
+    if (apiKey) {
+      void fetchAihubmixModels(apiKey)
+        .then((fetched) => {
+          for (const provider of Object.keys(MODEL_LIMITS) as TextProvider[]) {
+            const id = PROVIDER_IDS[provider];
+            api.registerModelCatalogProvider({
+              provider: id,
+              kinds: ["text"],
+              liveCatalog: async (ctx) => {
+                const resolved = ctx.resolveProviderApiKey(id)?.apiKey ?? apiKey;
+                if (!resolved) return null;
+                try {
+                  const fresh = await fetchAihubmixModels(resolved);
+                  return fresh[provider].map((model) => ({
+                    kind: "text" as const,
+                    provider: id,
+                    model: model.id,
+                    label: model.name,
+                    source: "live" as const,
+                  }));
+                } catch {
+                  return null;
+                }
+              },
+              staticCatalog: async () =>
+                fetched[provider].map((model) => ({
+                  kind: "text" as const,
+                  provider: id,
+                  model: model.id,
+                  label: model.name,
+                  source: "static" as const,
+                })),
+            });
+          }
+        })
+        .catch(() => {
+          // Catalog warm-up is best-effort; live catalog still falls back to the catalog hook.
+        });
+    }
+  },
+});
+
+export default entry;

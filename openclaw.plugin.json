@@ -1,6 +1,67 @@
 {
   "id": "aihubmix-auth",
-  "providers": ["aihubmix"],
+  "name": "AIHubmix",
+  "description": "Route OpenAI/Anthropic/Gemini model calls through AIHubmix",
+  "version": "2026.2.20",
+  "providers": [
+    "aihubmix-openai",
+    "aihubmix-anthropic",
+    "aihubmix-google",
+    "aihubmix-other"
+  ],
+  "modelSupport": {
+    "modelPrefixes": ["aihubmix-"]
+  },
+  "setup": {
+    "providers": [
+      {
+        "id": "aihubmix-openai",
+        "authMethods": ["api-key"],
+        "envVars": ["AIHUBMIX_API_KEY"]
+      },
+      {
+        "id": "aihubmix-anthropic",
+        "authMethods": ["api-key"],
+        "envVars": ["AIHUBMIX_API_KEY"]
+      },
+      {
+        "id": "aihubmix-google",
+        "authMethods": ["api-key"],
+        "envVars": ["AIHUBMIX_API_KEY"]
+      },
+      {
+        "id": "aihubmix-other",
+        "authMethods": ["api-key"],
+        "envVars": ["AIHUBMIX_API_KEY"]
+      }
+    ],
+    "requiresRuntime": true
+  },
+  "providerAuthChoices": [
+    {
+      "provider": "aihubmix-openai",
+      "method": "api-key",
+      "choiceId": "aihubmix-api-key-openai",
+      "choiceLabel": "AIHubmix OpenAI key",
+      "choiceHint": "Paste one AIHubmix key shared across all four transports",
+      "groupId": "aihubmix",
+      "groupLabel": "AIHubmix",
+      "optionKey": "aihubmixApiKey",
+      "cliFlag": "--aihubmix-api-key",
+      "cliOption": "--aihubmix-api-key <key>",
+      "cliDescription": "AIHubmix API key",
+      "onboardingScopes": ["text-inference"]
+    }
+  ],
+  "activation": {
+    "onStartup": false,
+    "onProviders": [
+      "aihubmix-openai",
+      "aihubmix-anthropic",
+      "aihubmix-google",
+      "aihubmix-other"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

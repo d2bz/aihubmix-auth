@@ -1,34 +1,58 @@
-import type { OpenClawPluginApi, ProviderAuthContext } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import aihubmixPlugin from "./index.js";
 
-type ModelOutput = { id: string };
+type FetchInput = Parameters<typeof fetch>[0];
 
-type AuthRunResult = {
-  profiles: Array<{
-    profileId: string;
-    credential: { provider: string; key?: string };
-  }>;
-  configPatch: {
-    models: {
-      providers: {
-        openai: { models: ModelOutput[] };
-        anthropic: { models: ModelOutput[] };
-        google: { models: ModelOutput[] };
-        other: { models: ModelOutput[] };
-      };
-    };
-  };
-  defaultModel?: string;
+type CatalogRunFn = (ctx: unknown) => Promise<unknown>;
+
+type AuthMethodRegistration = {
+  id: string;
+  label: string;
+  hint?: string;
+  kind: string;
+  run: (ctx: unknown) => Promise<unknown>;
+  runNonInteractive?: (ctx: unknown) => Promise<unknown>;
 };
 
 type RegisteredProvider = {
-  auth: Array<{
-    run: (ctx: ProviderAuthContext) => Promise<AuthRunResult>;
-  }>;
+  id: string;
+  label: string;
+  envVars: readonly string[];
+  catalog?: { run: CatalogRunFn };
+  staticCatalog?: { run: CatalogRunFn };
+  resolveDynamicModel?: (ctx: { modelId: string }) => unknown;
+  auth: AuthMethodRegistration[];
 };
 
-type FetchInput = Parameters<typeof fetch>[0];
+type RegisteredModelCatalog = {
+  provider: string;
+  kinds: readonly string[];
+  liveCatalog?: (ctx: unknown) => Promise<unknown>;
+  staticCatalog?: (ctx: unknown) => Promise<unknown>;
+};
+
+type Capture = {
+  providers: RegisteredProvider[];
+  catalogs: RegisteredModelCatalog[];
+};
+
+const PROVIDER_IDS = [
+  "aihubmix-openai",
+  "aihubmix-anthropic",
+  "aihubmix-google",
+  "aihubmix-other",
+] as const;
+
+function extractRequestUrl(input: FetchInput): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  return (input as Request).url;
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status });
+}
 
 function makeModelRecord(params: {
   modelId: string;
@@ -47,40 +71,44 @@ function makeModelRecord(params: {
   };
 }
 
-function extractRequestUrl(input: FetchInput): string {
-  if (typeof input === "string") {
-    return input;
+function findProvider(providers: RegisteredProvider[], id: string): RegisteredProvider {
+  const found = providers.find((p) => p.id === id);
+  if (!found) {
+    throw new Error(
+      `Expected provider ${id} to be registered (got: ${providers.map((p) => p.id).join(", ")})`,
+    );
   }
-  if (input instanceof URL) {
-    return input.toString();
-  }
-  return input.url;
+  return found;
 }
 
-async function runAuthFlow(provider: RegisteredProvider): Promise<AuthRunResult> {
-  const auth = provider.auth[0];
-  if (!auth) {
-    throw new Error("Auth flow was not registered.");
+function findCatalog(
+  catalogs: RegisteredModelCatalog[],
+  id: string,
+): RegisteredModelCatalog {
+  const found = catalogs.find((c) => c.provider === id);
+  if (!found) {
+    throw new Error(
+      `Expected catalog ${id} to be registered (got: ${catalogs.map((c) => c.provider).join(", ")})`,
+    );
   }
-  return auth.run({
-    prompter: {
-      text: async () => "sk-aihubmix-test-key",
-    },
-  } as unknown as ProviderAuthContext);
+  return found;
 }
 
 describe("aihubmix-auth plugin", () => {
   let originalFetch: typeof globalThis.fetch;
-  let registeredProvider: RegisteredProvider | undefined;
+  let capture: Capture;
 
   beforeEach(() => {
-    registeredProvider = undefined;
+    capture = { providers: [], catalogs: [] };
     originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn() as unknown as typeof globalThis.fetch;
 
     aihubmixPlugin.register({
       registerProvider(provider: unknown) {
-        registeredProvider = provider as RegisteredProvider;
+        capture.providers.push(provider as RegisteredProvider);
+      },
+      registerModelCatalogProvider(catalog: unknown) {
+        capture.catalogs.push(catalog as RegisteredModelCatalog);
       },
     } as unknown as OpenClawPluginApi);
   });
@@ -90,31 +118,47 @@ describe("aihubmix-auth plugin", () => {
     vi.restoreAllMocks();
   });
 
+  it("registers four providers (openai/anthropic/google/other)", () => {
+    const ids = capture.providers.map((p) => p.id).sort();
+    expect(ids).toEqual([...PROVIDER_IDS].sort());
+  });
+
+  it("configures every provider with an api-key auth method and AIHUBMIX_API_KEY env", () => {
+    for (const id of PROVIDER_IDS) {
+      const provider = findProvider(capture.providers, id);
+      const method = provider.auth[0];
+      expect(method).toBeDefined();
+      expect(method?.kind).toBe("api_key");
+      expect(typeof method?.run).toBe("function");
+      expect(provider.envVars).toContain("AIHUBMIX_API_KEY");
+    }
+  });
+
   it("requests model catalog with descending order", async () => {
     vi.mocked(globalThis.fetch).mockResolvedValue(
-      new Response(JSON.stringify({ data: [] }), { status: 200 }),
+      jsonResponse({ data: [] }),
     );
 
-    if (!registeredProvider) {
-      throw new Error("Provider registration was not captured.");
+    const provider = findProvider(capture.providers, "aihubmix-openai");
+    if (!provider.catalog) {
+      throw new Error("Provider catalog was not registered.");
     }
-
-    await runAuthFlow(registeredProvider);
+    await provider.catalog.run({
+      resolveProviderApiKey: () => ({ apiKey: "sk-aihubmix-test-key" }),
+    });
 
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     const [requestInput] = vi.mocked(globalThis.fetch).mock.calls[0] ?? [];
-    if (!requestInput) {
-      throw new Error("Expected fetch request input.");
-    }
+    if (!requestInput) throw new Error("Expected fetch request input.");
     const requestUrl = new URL(extractRequestUrl(requestInput));
     expect(requestUrl.searchParams.get("sort_by")).toBe("order");
     expect(requestUrl.searchParams.get("sort_order")).toBe("desc");
   });
 
-  it("keeps provider model lists in descending order by API order", async () => {
-    vi.mocked(globalThis.fetch).mockResolvedValue(
-      new Response(
-        JSON.stringify({
+  it("orders bucket models by descending API order across the four transports", async () => {
+    vi.mocked(globalThis.fetch).mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse({
           data: [
             makeModelRecord({ modelId: "gpt-low", order: 1 }),
             makeModelRecord({ modelId: "gpt-high", order: 9 }),
@@ -132,29 +176,89 @@ describe("aihubmix-auth plugin", () => {
             }),
           ],
         }),
-        { status: 200 },
       ),
     );
 
-    if (!registeredProvider) {
-      throw new Error("Provider registration was not captured.");
+    const fetchFor = (providerId: string) => ({
+      resolveProviderApiKey: (id?: string) =>
+        id === providerId
+          ? { apiKey: "sk-aihubmix-test-key" }
+          : { apiKey: undefined },
+    });
+
+    const openai = findProvider(capture.providers, "aihubmix-openai");
+    const anthropic = findProvider(capture.providers, "aihubmix-anthropic");
+    const other = findProvider(capture.providers, "aihubmix-other");
+    if (!openai.catalog || !anthropic.catalog || !other.catalog) {
+      throw new Error("Provider catalogs were not registered.");
     }
 
-    const result = await runAuthFlow(registeredProvider);
+    const openaiResult = (await openai.catalog.run(fetchFor("aihubmix-openai"))) as {
+      provider: { models: Array<{ id: string }> };
+    };
+    const anthropicResult = (await anthropic.catalog.run(
+      fetchFor("aihubmix-anthropic"),
+    )) as { provider: { models: Array<{ id: string }> } };
+    const otherResult = (await other.catalog.run(fetchFor("aihubmix-other"))) as {
+      provider: { models: Array<{ id: string }> };
+    };
 
-    expect(result.configPatch.models.providers.openai.models.map((model) => model.id)).toEqual([
+    expect(openaiResult.provider.models.map((m) => m.id)).toEqual([
       "gpt-high",
       "gpt-low",
     ]);
-    expect(result.configPatch.models.providers.anthropic.models.map((model) => model.id)).toEqual([
+    expect(anthropicResult.provider.models.map((m) => m.id)).toEqual([
       "claude-high",
       "claude-low",
     ]);
-    expect(result.configPatch.models.providers.other.models.map((model) => model.id)).toEqual([
+    expect(otherResult.provider.models.map((m) => m.id)).toEqual([
       "custom-high",
       "custom-low",
     ]);
-    expect(result.defaultModel).toBe("openai/gpt-high");
-    expect(result.profiles.map((profile) => profile.profileId)).toContain("other:aihubmix");
+  });
+
+  it("returns null catalog when no api key is available", async () => {
+    const provider = findProvider(capture.providers, "aihubmix-openai");
+    if (!provider.catalog) {
+      throw new Error("Provider catalog was not registered.");
+    }
+    const result = await provider.catalog.run({
+      resolveProviderApiKey: () => ({ apiKey: undefined }),
+    });
+    expect(result).toBeNull();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("registers a unified model catalog provider for every transport", () => {
+    for (const id of PROVIDER_IDS) {
+      const catalog = findCatalog(capture.catalogs, id);
+      expect(catalog.kinds).toEqual(["text"]);
+      expect(typeof catalog.liveCatalog).toBe("function");
+      expect(typeof catalog.staticCatalog).toBe("function");
+    }
+  });
+
+  it("live catalog returns provider-scoped rows for the requested transport", async () => {
+    vi.mocked(globalThis.fetch).mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse({
+          data: [
+            makeModelRecord({ modelId: "gpt-x", order: 5 }),
+            makeModelRecord({
+              modelId: "claude-x",
+              order: 4,
+              endpoints: ["claude_api"],
+            }),
+          ],
+        }),
+      ),
+    );
+    const openai = findCatalog(capture.catalogs, "aihubmix-openai");
+    if (!openai.liveCatalog) throw new Error("liveCatalog was not registered.");
+    const rows = (await openai.liveCatalog({
+      resolveProviderApiKey: () => ({ apiKey: "sk-aihubmix-test-key" }),
+    })) as Array<{ provider: string; model: string }>;
+    expect(rows.find((r) => r.model === "gpt-x")).toBeDefined();
+    expect(rows.find((r) => r.model === "claude-x")).toBeUndefined();
   });
 });
